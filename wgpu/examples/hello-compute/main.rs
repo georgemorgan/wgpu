@@ -5,16 +5,11 @@ use wgpu::util::DeviceExt;
 const OVERFLOW: u32 = 0xffffffff;
 
 async fn run() {
-    let numbers = if std::env::args().len() <= 1 {
-        let default = vec![1, 2, 3, 4];
-        println!("No numbers were provided, defaulting to {:?}", default);
-        default
-    } else {
-        std::env::args()
-            .skip(1)
-            .map(|s| u32::from_str(&s).expect("You must pass a list of positive integers!"))
-            .collect()
-    };
+    let mut numbers = vec![];
+
+    for i in 0..60000 {
+        numbers.push(i);
+    }
 
     let steps = execute_gpu(&numbers).await.unwrap();
 
@@ -102,29 +97,96 @@ async fn execute_gpu_inner(
             | wgpu::BufferUsages::COPY_SRC,
     });
 
+    let mut lots_of_data: Vec<u32> = vec![];
+
+    // Load u32 * 8MB data
+    for i in 0..8 * 1024 * 1024 {
+        lots_of_data.push(i);
+    }
+
+    let lots_of_data_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Big Buffer"),
+        contents: bytemuck::cast_slice(&lots_of_data),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+
     // A bind group defines how buffers are accessed by shaders.
     // It is to WebGPU what a descriptor set is to Vulkan.
     // `binding` here refers to the `binding` of a buffer in the shader (`layout(set = 0, binding = 0) buffer`).
 
-    // A pipeline specifies the operation of a shader
+    // Instantiates the bind group, once again specifying the binding of buffers.
+    let bind_group_0_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(
+                        (numbers.len() * std::mem::size_of::<f32>()) as _,
+                    ),
+                },
+                count: None,
+            },
+        ],
+        label: None,
+    });
 
+    let bind_group_1_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(
+                        (lots_of_data.len() * std::mem::size_of::<u32>()) as _,
+                    ),
+                },
+                count: None,
+            },
+        ],
+        label: None,
+    });
+
+    let compute_pipeline_layout =
+    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("compute"),
+        bind_group_layouts: &[&bind_group_0_layout, &bind_group_1_layout],
+        push_constant_ranges: &[],
+    });
+
+    // A pipeline specifies the operation of a shader
     // Instantiates the pipeline.
     let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
-        layout: None,
+        layout: Some(&compute_pipeline_layout),
         module: &cs_module,
         entry_point: "main",
     });
-
-    // Instantiates the bind group, once again specifying the binding of buffers.
-    let bind_group_layout = compute_pipeline.get_bind_group_layout(0);
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    
+    let bind_group_0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
-        layout: &bind_group_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: storage_buffer.as_entire_binding(),
-        }],
+        layout: &bind_group_0_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: storage_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    let bind_group_1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &bind_group_1_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: lots_of_data_buffer.as_entire_binding(),
+            },
+        ],
     });
 
     // A command encoder executes one or many pipelines.
@@ -134,7 +196,8 @@ async fn execute_gpu_inner(
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None });
         cpass.set_pipeline(&compute_pipeline);
-        cpass.set_bind_group(0, &bind_group, &[]);
+        cpass.set_bind_group(0, &bind_group_0, &[]);
+        cpass.set_bind_group(1, &bind_group_1, &[]);
         cpass.insert_debug_marker("compute collatz iterations");
         cpass.dispatch(numbers.len() as u32, 1, 1); // Number of cells to run, the (x,y,z) size of item being processed
     }
